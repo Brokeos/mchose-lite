@@ -124,10 +124,13 @@ Le détail est dans [`src/protocol.rs`](src/protocol.rs).
 - Pas de mise à jour de firmware : utilise l'outil officiel pour ça.
 - Windows uniquement.
 
-## Avertissement
+## Mentions légales
 
-Projet personnel non officiel, sans lien avec MCHOSE (迈从科技). « MCHOSE » est une
-marque de son propriétaire ; l'icône de l'application provient de MCHOSE HUB.
+Projet indépendant, non affilié à MCHOSE (迈从科技). Les marques et l'icône de l'application restent
+la propriété de leurs titulaires ; le protocole a été documenté à des fins d'interopérabilité.
+**Ayants droit : pour toute demande de retrait (icône, marque, documentation), ouvrez une
+issue et l'élément sera retiré rapidement.** Détails dans [LEGAL.md](LEGAL.md).
+
 Logiciel fourni tel quel, sans garantie.
 
 ## Licence
