@@ -1,4 +1,4 @@
-//! Protocole HID des souris MCHOSE (L7 / A7 / M7...), extrait du driver web officiel.
+//! Protocole HID des souris MCHOSE (L7 / A7 / M7 / K7), extrait du driver web officiel.
 //!
 //! - Feature reports `0x11` (20 octets) et `0x12` (64 octets) sur la collection
 //!   vendeur `usage_page 0xFF01`.
@@ -10,6 +10,9 @@ use hidapi::{HidApi, HidDevice};
 use std::{fmt, thread, time::Duration};
 
 pub const VENDOR_ID: u16 = 0x5253;
+const K7_VENDOR_ID: u16 = 0x3837;
+const K7_WIRED_PID: u16 = 0x4150;
+const K7_RECEIVER_PID: u16 = 0x1001;
 const VENDOR_USAGE_PAGE: u16 = 0xFF01;
 const ACK_REPORT: u8 = 0x13;
 const ACK_TAG: u8 = 0xE5;
@@ -22,16 +25,28 @@ pub const RATES_1K: &[u16] = &[125, 500, 1000];
 #[derive(Debug)]
 pub enum Error {
     NotFound,
+    Offline,
     Hid(hidapi::HidError),
     BadReply(u8),
+    InvalidRate(u8),
+    RateNotApplied { expected: u16, actual: Option<u16> },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotFound => write!(f, "souris MCHOSE introuvable"),
+            Error::Offline => write!(f, "souris en veille ou éteinte : bougez-la pour la réveiller, puis réessayez"),
             Error::Hid(e) => write!(f, "erreur HID : {e}"),
             Error::BadReply(c) => write!(f, "réponse invalide à la commande 0x{c:02X}"),
+            Error::InvalidRate(i) => write!(f, "indice de fréquence non pris en charge : {i}"),
+            Error::RateNotApplied { expected, actual } => {
+                write!(f, "fréquence {expected} Hz non enregistrée")?;
+                if let Some(actual) = actual {
+                    write!(f, " (la souris indique {actual} Hz)")?;
+                }
+                write!(f, ". Réveillez la souris et fermez MCHOSE HUB, puis réessayez.")
+            }
         }
     }
 }
@@ -48,11 +63,19 @@ fn report_len(report_id: u8) -> usize {
     if report_id == 0x11 { 20 } else { 64 }
 }
 
+fn supported_device(vendor_id: u16, product_id: u16, usage_page: u16) -> bool {
+    usage_page == VENDOR_USAGE_PAGE
+        && (vendor_id == VENDOR_ID
+            || (vendor_id == K7_VENDOR_ID && matches!(product_id, K7_WIRED_PID | K7_RECEIVER_PID)))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub name: String,
     /// PID du récepteur ou de la souris en filaire.
     pub product_id: u16,
+    /// PID de la connexion active (0x11 0x03), notamment le récepteur en 2.4G.
+    pub connection_pid: u16,
     /// PID de la souris elle-même (0x11 0x06).
     pub mouse_pid: u16,
     pub wireless: bool,
@@ -63,9 +86,10 @@ pub struct Info {
 
 impl Info {
     /// Fréquences proposées selon le récepteur (logique du driver officiel :
-    /// 0x1021 = récepteur 1K, le reste des L7/A7/M7 Pro/Ultra = 8K).
+    /// 0x1021 = récepteur 1K, 0x1020 / K7 0x1001 = récepteur 8K).
     pub fn rates(&self) -> &'static [u16] {
-        if self.wireless && self.product_id == 0x1021 { RATES_1K } else { RATES_8K }
+        let pid = if self.connection_pid != 0 { self.connection_pid } else { self.product_id };
+        if self.wireless && pid == 0x1021 { RATES_1K } else { RATES_8K }
     }
 
     /// Souris en veille ou éteinte : le récepteur répond alors avec des zéros
@@ -99,9 +123,12 @@ pub struct Config {
 }
 
 impl Config {
-    fn parse(d: &[u8]) -> Option<Self> {
+    fn parse(d: &[u8]) -> Result<Self> {
         if d.len() < 63 {
-            return None;
+            return Err(Error::BadReply(0x67));
+        }
+        if d[..63].iter().all(|&b| b == 0) {
+            return Err(Error::Offline);
         }
         let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
         let dpi = std::array::from_fn(|i| u16_at(4 + i * 2));
@@ -112,12 +139,15 @@ impl Config {
             (1, 0) => 2,
             _ => 3,
         };
-        Some(Self {
+        Ok(Self {
             profile: d[0],
-            wireless_dpi_index: d[1] >> 4,
-            wireless_rate_index: d[1] & 0x0F,
-            usb_dpi_index: d[2] >> 4,
-            usb_rate_index: d[2] & 0x0F,
+            // USB puis 2.4G ; chaque octet contient (fréquence << 4) | niveau DPI.
+            // Le parseur bit4 little-endian du pilote web regroupe ces deux octets.
+            // Une config symétrique telle que 0x22 0x22 masque les deux inversions.
+            wireless_dpi_index: d[2] & 0x0F,
+            wireless_rate_index: d[2] >> 4,
+            usb_dpi_index: d[1] & 0x0F,
+            usb_rate_index: d[1] >> 4,
             reserved: d[3],
             dpi,
             dpi_y,
@@ -152,7 +182,9 @@ impl Mouse {
         let api = HidApi::new()?;
         let entry = api
             .device_list()
-            .find(|d| d.vendor_id() == VENDOR_ID && d.usage_page() == VENDOR_USAGE_PAGE)
+            .filter(|d| supported_device(d.vendor_id(), d.product_id(), d.usage_page()))
+            // Le câble prend la main sur la radio : privilégier la K7 filaire si les deux sont branchés.
+            .min_by_key(|d| !(d.vendor_id() == K7_VENDOR_ID && d.product_id() == K7_WIRED_PID))
             .ok_or(Error::NotFound)?;
         let product_id = entry.product_id();
         let name = entry.product_string().unwrap_or("MCHOSE").to_owned();
@@ -164,6 +196,10 @@ impl Mouse {
 
     pub fn refresh_info(&mut self) -> Result<()> {
         let conn = self.read(0x11, 0x03)?;
+        if conn.len() < 7 {
+            return Err(Error::BadReply(0x03));
+        }
+        self.info.connection_pid = u16::from_le_bytes([conn[3], conn[4]]);
         self.info.wireless = conn.get(5).copied().unwrap_or(0) == 1;
         let ver = self.read(0x11, 0x04)?;
         let len = (ver[0] as usize).min(ver.len() - 1);
@@ -181,7 +217,7 @@ impl Mouse {
 
     pub fn config(&self) -> Result<Config> {
         let d = self.read(0x12, 0x67)?;
-        Config::parse(&d).ok_or(Error::BadReply(0x67))
+        Config::parse(&d)
     }
 
     fn send(&self, report_id: u8, payload: &[u8]) -> Result<()> {
@@ -201,7 +237,9 @@ impl Mouse {
         let deadline = std::time::Instant::now() + Duration::from_millis(ACK_TIMEOUT_MS as u64);
         while std::time::Instant::now() < deadline {
             match self.dev.read_timeout(&mut buf, ACK_TIMEOUT_MS) {
-                Ok(n) if n >= 3 && buf[0] == ACK_REPORT && !buf[1] == ACK_TAG && !buf[2] == cmd => return,
+                Ok(n) if n >= 3 && buf[0] == ACK_REPORT && !buf[1] == ACK_TAG && !buf[2] == cmd => {
+                    return;
+                }
                 Ok(0) | Err(_) => return,
                 Ok(_) => {}
             }
@@ -240,8 +278,22 @@ impl Mouse {
     }
 
     pub fn set_rate(&self, wireless: bool, index: u8) -> Result<()> {
-        let (usb, rf) = if wireless { (0, index) } else { (index, 0) };
-        self.send(0x11, &[0x41, usb, rf])
+        let rates = self.info.rates();
+        let expected = *rates.get(index as usize).ok_or(Error::InvalidRate(index))?;
+        let current = self.config()?;
+        // La commande contient les deux connexions : préserver celle qui n'est pas modifiée.
+        let (usb, rf) = if wireless { (current.usb_rate_index, index) } else { (index, current.wireless_rate_index) };
+        self.send(0x11, &[0x41, usb, rf])?;
+        let mut actual = None;
+        for _ in 0..READ_RETRIES {
+            thread::sleep(Duration::from_millis(50));
+            let cfg = self.config()?;
+            if cfg.rate_index(wireless) == index {
+                return Ok(());
+            }
+            actual = rates.get(cfg.rate_index(wireless) as usize).copied();
+        }
+        Err(Error::RateNotApplied { expected, actual })
     }
 
     /// LOD, ripple control, angle snapping, motion sync et mode performance.
@@ -295,10 +347,19 @@ mod tests {
 
     /// Réponse réelle d'une L7 Pro (0x12 0x67, décodée, sans l'octet de commande).
     const L7_PRO_CONFIG: [u8; 63] = [
-        0x00, 0x22, 0x22, 0x02, 0x90, 0x01, 0x20, 0x03, 0xe8, 0x03, 0x80, 0x0c, 0x00, 0x19, 0x90, 0x65, 0x06,
-        0x02, 0x08, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00,
-        0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
-        0x90, 0x01, 0x20, 0x03, 0xe8, 0x03, 0x80, 0x0c, 0x00, 0x19, 0x90, 0x65,
+        0x00, 0x22, 0x22, 0x02, 0x90, 0x01, 0x20, 0x03, 0xe8, 0x03, 0x80, 0x0c, 0x00, 0x19, 0x90, 0x65, 0x06, 0x02,
+        0x08, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x90, 0x01, 0x20,
+        0x03, 0xe8, 0x03, 0x80, 0x0c, 0x00, 0x19, 0x90, 0x65,
+    ];
+
+    /// K7 Ultra 2.4G, récepteur 5253:1020, firmware 5.28.5.0.
+    /// Lecture matérielle du 22/10/2026 : USB 1000 Hz, radio 8000 Hz, DPI actif 0.
+    const K7_ULTRA_CONFIG: [u8; 63] = [
+        0x00, 0x20, 0x50, 0x00, 0xb0, 0x04, 0xe2, 0x04, 0xe2, 0x04, 0xe2, 0x04, 0xe2, 0x04, 0xe2, 0x04, 0x01, 0x02,
+        0x08, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xb0, 0x04, 0xe2,
+        0x04, 0xe2, 0x04, 0xe2, 0x04, 0xe2, 0x04, 0xe2, 0x04,
     ];
 
     #[test]
@@ -309,5 +370,97 @@ mod tests {
         assert_eq!((c.dpi_stages, c.wireless_dpi_index, c.wireless_rate_index), (6, 2, 2));
         assert_eq!((c.lod, c.ripple, c.angle_snap, c.motion_sync, c.perf_mode), (2, false, false, false, 1));
         assert_eq!((c.debounce_ms, c.sleep_min), (8, 3));
+    }
+
+    #[test]
+    fn parses_real_k7_ultra_config() {
+        let c = Config::parse(&K7_ULTRA_CONFIG).unwrap();
+        assert_eq!((c.dpi_stages, c.dpi[0], c.dpi_y[0]), (1, 1200, 1200));
+        assert_eq!((c.dpi_index(false), c.dpi_index(true)), (0, 0));
+        assert_eq!((c.rate_index(false), c.rate_index(true)), (2, 5));
+        assert_eq!(RATES_8K[c.rate_index(true) as usize], 8000);
+    }
+
+    #[test]
+    fn decodes_different_usb_and_wireless_dpi_and_rates() {
+        let mut data = K7_ULTRA_CONFIG;
+        data[1] = 0x31;
+        data[2] = 0x52;
+        data[16] = 6;
+        let c = Config::parse(&data).unwrap();
+        assert_eq!((c.dpi_index(false), c.rate_index(false)), (1, 3));
+        assert_eq!((c.dpi_index(true), c.rate_index(true)), (2, 5));
+    }
+
+    #[test]
+    fn rejects_sleeping_and_truncated_configs() {
+        assert!(matches!(Config::parse(&[0; 63]), Err(Error::Offline)));
+        for len in 0..63 {
+            assert!(matches!(Config::parse(&K7_ULTRA_CONFIG[..len]), Err(Error::BadReply(0x67))));
+        }
+    }
+
+    #[test]
+    fn detects_k7_interfaces_without_opening_the_charging_dock() {
+        for (vid, pid) in
+            [(VENDOR_ID, 0x1020), (VENDOR_ID, 0x1021), (K7_VENDOR_ID, K7_WIRED_PID), (K7_VENDOR_ID, K7_RECEIVER_PID)]
+        {
+            assert!(supported_device(vid, pid, VENDOR_USAGE_PAGE));
+            assert!(!supported_device(vid, pid, 0xFF0B));
+            assert!(!supported_device(vid, pid, 0x0001));
+        }
+        assert!(!supported_device(K7_VENDOR_ID, 0x1012, VENDOR_USAGE_PAGE));
+        assert!(!supported_device(0x1234, K7_WIRED_PID, VENDOR_USAGE_PAGE));
+    }
+
+    #[test]
+    fn limits_rates_using_the_active_receiver() {
+        let mut info = Info { product_id: K7_WIRED_PID, connection_pid: 0x1021, wireless: true, ..Default::default() };
+        assert_eq!(info.rates(), RATES_1K);
+        info.connection_pid = K7_RECEIVER_PID;
+        assert_eq!(info.rates(), RATES_8K);
+        info.connection_pid = 0x1020;
+        assert_eq!(info.rates(), RATES_8K);
+        info.connection_pid = 0;
+        info.product_id = 0x1021;
+        assert_eq!(info.rates(), RATES_1K);
+        info.wireless = false;
+        assert_eq!(info.rates(), RATES_8K);
+    }
+
+    #[test]
+    #[ignore = "nécessite une K7 Ultra éveillée ; change les Hz puis restaure la fréquence initiale"]
+    fn hardware_k7_ultra_polling_rates() {
+        let _lock = crate::sys::NamedMutex::hid();
+        let mouse = Mouse::open().expect("K7 Ultra connectée");
+        assert!(mouse.info.name.contains("K7 Ultra"));
+        assert!(!mouse.info.offline(), "Réveillez la souris");
+        let original = mouse.config().unwrap();
+        let wireless = mouse.info.wireless;
+
+        struct RestoreRate<'a>(&'a Mouse, bool, u8);
+        impl Drop for RestoreRate<'_> {
+            fn drop(&mut self) {
+                if let Err(e) = self.0.set_rate(self.1, self.2) {
+                    eprintln!("Restauration de la fréquence initiale impossible : {e}");
+                }
+            }
+        }
+        let restore = RestoreRate(&mouse, wireless, original.rate_index(wireless));
+        for (index, hz) in mouse.info.rates().iter().enumerate() {
+            let old = mouse.config().unwrap();
+            let mut expected = original.clone();
+            if wireless {
+                expected.wireless_rate_index = index as u8;
+            } else {
+                expected.usb_rate_index = index as u8;
+            }
+            mouse.apply(&old, &expected).unwrap();
+            let actual = mouse.config().unwrap();
+            assert_eq!(actual, expected, "{hz} Hz ; les autres réglages doivent être préservés");
+            println!("{hz} Hz : fréquence relue et autres réglages préservés");
+        }
+        drop(restore);
+        assert_eq!(mouse.config().unwrap(), original, "Configuration initiale restaurée");
     }
 }

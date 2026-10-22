@@ -41,6 +41,10 @@ qu'une petite icône de batterie, facultative.
 - **Profils embarqués** 1 à 3, commutables depuis l'app ou en ligne de commande.
 - **Seuls les réglages modifiés** sont écrits dans la souris.
 - **Souris en veille détectée** : l'app ne propose jamais d'écrire une configuration vide.
+- **Éclairage du MagDock** : onglet indépendant avec marche / arrêt, couleur RGB,
+  luminosité sur cinq niveaux et effets *Fixe / Respiration / Scintillement /
+  Cycle de couleurs / Vague multicolore*. Les effets animés compatibles proposent
+  aussi un réglage de vitesse. Le dock reste accessible quand la souris dort.
 
 ### Batterie dans la zone de notification
 
@@ -60,7 +64,15 @@ qu'une petite icône de batterie, facultative.
 | Appareil | USB | État |
 |---|---|---|
 | MCHOSE L7 Pro (récepteur 8K) | `5253:1020` | testé (firmware 5.12.5.0) |
-| Autres L7 / A7 / M7 / K7 (VID `5253`) | | même protocole, non testé |
+| MCHOSE K7 Ultra (récepteur 8K) | `5253:1020` | fréquences 125 / 500 / 1 000 / 2 000 / 4 000 / 8 000 Hz écrites et relues (firmware 5.28.5.0) |
+| MCHOSE K7 Ultra (filaire / récepteur dédié) | `3837:4150` / `3837:1001` | détection ajoutée d'après le pilote officiel ; matériel non testé dans ces modes |
+| MCHOSE MagDock | `3837:1012` | éclairage écrit et relu sur le dock : RGB, cinq effets, luminosité et extinction |
+| Autres L7 / A7 / M7 (VID `5253`) | | même protocole, non testé |
+
+La fréquence proposée tient compte du récepteur : le modèle `1021` reste limité à
+1 000 Hz. Après un changement de fréquence, l'application relit la configuration et
+signale une erreur si la valeur demandée n'a pas été enregistrée. Le Bluetooth ne
+permet pas de configurer la souris avec ce protocole.
 
 ## Installation
 
@@ -71,6 +83,14 @@ qu'une petite icône de batterie, facultative.
 
 > Windows 11 range les nouvelles icônes dans le menu `^` de la barre des tâches :
 > fais-la glisser dans la barre pour la garder visible.
+
+## Éclairage du dock
+
+Pour changer l'éclairage, ouvre l'onglet **Dock**, choisis l'effet et les réglages,
+puis clique sur **Appliquer**. *Fixe* et *Respiration* permettent de choisir une
+couleur personnalisée ; les autres effets gèrent leurs couleurs automatiquement.
+Le bouton **Recharger** relit les réglages et retrouve un dock reconnecté. Les
+changements ne sont annoncés comme enregistrés qu'après confirmation par le dock.
 
 ## Utilisation en ligne de commande
 
@@ -116,11 +136,40 @@ Le protocole a été reconstitué à partir du driver web officiel, puis vérifi
   `0x11 0x42` le capteur, `0x11 0x43` l'anti-rebond, `0x11 0x0A` la veille,
   `0x11 0x58` le profil, `0x11 0x06` la batterie.
 
-Le détail est dans [`src/protocol.rs`](src/protocol.rs).
+Le détail est dans [`src/protocol.rs`](src/protocol.rs). La correction du décodage
+USB / 2.4G et la vérification sur K7 Ultra sont documentées dans
+[`docs/k7-ultra-protocol.md`](docs/k7-ultra-protocol.md).
+Le protocole distinct du dock est décrit dans
+[`docs/magdock-protocol.md`](docs/magdock-protocol.md) et implémenté dans
+[`src/dock.rs`](src/dock.rs).
+
+### Vérification
+
+```powershell
+cargo test
+cargo clippy --all-targets
+```
+
+Le test matériel est désactivé par défaut. Avec une **K7 Ultra éveillée**, il parcourt
+les fréquences disponibles, vérifie leur relecture et la conservation des autres
+réglages, puis restaure la fréquence initiale :
+
+```powershell
+cargo test hardware_k7_ultra_polling_rates -- --ignored --nocapture --test-threads=1
+```
+
+Avec un **MagDock branché**, le test ci-dessous vérifie l'éclairage puis restaure
+ses valeurs initiales. Il peut brièvement changer les couleurs du dock :
+
+```powershell
+cargo test hardware_magdock_lighting -- --ignored --nocapture --test-threads=1
+```
 
 ## Limites
 
-- Pas de remappage des boutons, de macros ni d'éclairage.
+- Pas de remappage des boutons ni de macros.
+- Éclairage pris en charge uniquement sur le MagDock `3837:1012` ; pas de
+  synchronisation musicale ni de flux audio.
 - Pas de mise à jour de firmware : utilise l'outil officiel pour ça.
 - Windows uniquement.
 
