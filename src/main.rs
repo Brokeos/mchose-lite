@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod gui;
+mod dock;
 mod icon;
 mod protocol;
 mod sys;

@@ -2,7 +2,7 @@
 name = "mchose-lite"
 version = "0.1.0"
 edition = "2024"
-description = "Remplaçant léger de MCHOSE HUB (souris MCHOSE L7 Pro) en Rust"
+description = "Remplaçant léger de MCHOSE HUB (souris MCHOSE L7 Pro et K7 Ultra) en Rust"
 license = "MIT"
 repository = "https://github.com/Brokeos/mchose-lite"
 readme = "README.md"
